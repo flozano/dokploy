@@ -1,5 +1,11 @@
-import { createHash, createVerify, generateKeyPairSync } from "node:crypto";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	createHash,
+	createPublicKey,
+	createVerify,
+	generateKeyPairSync,
+	type KeyObject,
+} from "node:crypto";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const findMany = vi.fn();
 
@@ -997,6 +1003,7 @@ describe("oci client", () => {
 
 	const config = {
 		providerType: "oci" as const,
+		authType: "apiKey" as const,
 		region: "eu-madrid-1",
 		tenancyId: "ocid1.tenancy.oc1..aaaatenancy",
 		userId: "ocid1.user.oc1..aaaauser",
@@ -1243,12 +1250,13 @@ describe("oci client", () => {
 		expect(mockFetch).toHaveBeenCalledTimes(2);
 	});
 
-	it("resolves env refs end to end through an oci provider", async () => {
+	it("resolves env refs end to end, reading a config without authType as an API key", async () => {
+		const { authType: _, ...storedConfig } = config;
 		findMany.mockResolvedValue([
 			{
 				name: "oci-prod",
 				providerType: "oci",
-				config,
+				config: storedConfig,
 				assignments: assignedEverywhere,
 			},
 		]);
@@ -1280,5 +1288,252 @@ describe("oci client", () => {
 				ociVaultConfigSchema.safeParse({ ...config, ...override }).success,
 			).toBe(false);
 		}
+	});
+
+	it("defaults to API keys and accepts instance principals without key fields", () => {
+		const { authType: _, ...withoutAuthType } = config;
+		expect(ociVaultConfigSchema.parse(withoutAuthType).authType).toBe("apiKey");
+		expect(
+			ociVaultConfigSchema.safeParse({
+				providerType: "oci",
+				authType: "instancePrincipal",
+				region: config.region,
+				vaultId: config.vaultId,
+				compartmentId: config.compartmentId,
+			}).success,
+		).toBe(true);
+	});
+
+	describe("with an instance principal", () => {
+		const instanceConfig = {
+			providerType: "oci" as const,
+			authType: "instancePrincipal" as const,
+			region: "eu-madrid-1",
+			vaultId: config.vaultId,
+			compartmentId: config.compartmentId,
+		};
+		// Stands in for the metadata service's certificate; only its bytes and subject are used.
+		const instanceCertificate = `-----BEGIN CERTIFICATE-----
+MIIC8jCCApmgAwIBAgIUFjnEa/Tdf5vS++X8iJxLzRRRiWIwCgYIKoZIzj0EAwIw
+gc0xNDAyBgNVBAMMK29jaWQxLmluc3RhbmNlLm9jMS5ldS1tYWRyaWQtMS5hYWFh
+aW5zdGFuY2UxHjAcBgNVBAsMFW9wYy1jZXJ0dHlwZTppbnN0YW5jZTFBMD8GA1UE
+Cww4b3BjLWluc3RhbmNlOm9jaWQxLmluc3RhbmNlLm9jMS5ldS1tYWRyaWQtMS5h
+YWFhaW5zdGFuY2UxMjAwBgNVBAsMKW9wYy10ZW5hbnQ6b2NpZDEudGVuYW5jeS5v
+YzEuLmFhYWF0ZW5hbmN5MCAXDTI2MTExMjA2Mjk1OVoYDzIxMjYxMDE5MDYyOTU5
+WjCBzTE0MDIGA1UEAwwrb2NpZDEuaW5zdGFuY2Uub2MxLmV1LW1hZHJpZC0xLmFh
+YWFpbnN0YW5jZTEeMBwGA1UECwwVb3BjLWNlcnR0eXBlOmluc3RhbmNlMUEwPwYD
+VQQLDDhvcGMtaW5zdGFuY2U6b2NpZDEuaW5zdGFuY2Uub2MxLmV1LW1hZHJpZC0x
+LmFhYWFpbnN0YW5jZTEyMDAGA1UECwwpb3BjLXRlbmFudDpvY2lkMS50ZW5hbmN5
+Lm9jMS4uYWFhYXRlbmFuY3kwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQ18Hvh
+v9E64QNifV7JtMrkfFpFBmVXljRS8GAbYQGWGP/FPfs6jaeQf5hNxvmhJmJJB8z9
+lYjzib4vOIesFQ7co1MwUTAdBgNVHQ4EFgQUiJcLs6jGThrPtB25sSqzG8lal8Qw
+HwYDVR0jBBgwFoAUiJcLs6jGThrPtB25sSqzG8lal8QwDwYDVR0TAQH/BAUwAwEB
+/zAKBggqhkjOPQQDAgNHADBEAiAEu6sCEFG/x/V2MephE63Zj+5ckime+HWFqa0q
+G/jz1AIgbpDYC491wg4uXQdrtC3T9C+iicnTIOZZPvwKaRRBuMU=
+-----END CERTIFICATE-----`;
+		const instanceKey = generateKeyPairSync("rsa", { modulusLength: 2048 });
+		const metadataUrl = "http://169.254.169.254/opc/v2/";
+		const authUrl = "https://auth.eu-madrid-1.oraclecloud.com/v1/x509";
+		const metadata: Record<string, string> = {
+			"identity/cert.pem": instanceCertificate,
+			"identity/key.pem": instanceKey.privateKey.export({
+				type: "pkcs8",
+				format: "pem",
+			}) as string,
+			"identity/intermediate.pem": instanceCertificate,
+			"instance/canonicalRegionName": "eu-madrid-1",
+		};
+		const certificateDer = Buffer.from(
+			instanceCertificate.replace(/-----[A-Z ]+-----|\s/g, ""),
+			"base64",
+		);
+
+		const sessionToken = (expiresInSeconds: number) => {
+			const encode = (value: object) =>
+				Buffer.from(JSON.stringify(value)).toString("base64url");
+			return `${encode({ alg: "RS256" })}.${encode({
+				exp: Math.floor(Date.now() / 1000) + expiresInSeconds,
+			})}.signature`;
+		};
+
+		const metadataResponse = (url: string) =>
+			new Response(metadata[url.slice(metadataUrl.length)]);
+
+		const mockOci = (token: string) => {
+			mockFetch.mockImplementation(async (url: string) => {
+				if (url.startsWith(metadataUrl)) {
+					return metadataResponse(url);
+				}
+				if (url === authUrl) {
+					return ociResponse({ token });
+				}
+				return bundleResponse("s3cret");
+			});
+		};
+
+		const calls = () => mockFetch.mock.calls as [string, RequestInit][];
+		const callTo = (match: (url: string) => boolean) =>
+			calls().find(([url]) => match(url)) as [string, RequestInit];
+
+		const verifies = (
+			init: RequestInit,
+			signingString: string,
+			key: KeyObject,
+		) =>
+			createVerify("RSA-SHA256")
+				.update(signingString)
+				.verify(
+					key,
+					parseAuthorization(
+						(init.headers as Record<string, string>).authorization as string,
+					).signature as string,
+					"base64",
+				);
+
+		const loadClient = async () => {
+			vi.resetModules();
+			return (await import("@dokploy/server/utils/vault/oci")).ociClient;
+		};
+
+		beforeEach(() => {
+			vi.stubEnv("DOKPLOY_OCI_INSTANCE_PRINCIPAL", "true");
+		});
+
+		afterEach(() => {
+			vi.unstubAllEnvs();
+		});
+
+		it("exchanges the instance certificate for a token and signs with the session key", async () => {
+			const token = sessionToken(1200);
+			mockOci(token);
+			const client = await loadClient();
+
+			const result = await client.getSecrets(instanceConfig, ["db-url"]);
+
+			expect(result).toEqual({ "db-url": "s3cret" });
+			for (const [, init] of calls().filter(([url]) =>
+				url.startsWith(metadataUrl),
+			)) {
+				expect((init.headers as Record<string, string>).Authorization).toBe(
+					"Bearer Oracle",
+				);
+			}
+
+			const [, federation] = callTo((url) => url === authUrl);
+			const body = federation.body as string;
+			const payload = JSON.parse(body);
+			expect(payload).toMatchObject({
+				certificate: certificateDer.toString("base64"),
+				intermediateCertificates: [certificateDer.toString("base64")],
+				purpose: "DEFAULT",
+			});
+			const federationHeaders = federation.headers as Record<string, string>;
+			const certificateFingerprint = (
+				createHash("sha1")
+					.update(certificateDer)
+					.digest("hex")
+					.match(/../g) as string[]
+			).join(":");
+			expect(
+				parseAuthorization(federationHeaders.authorization as string).keyId,
+			).toBe(
+				`ocid1.tenancy.oc1..aaaatenancy/fed-x509/${certificateFingerprint}`,
+			);
+			const bodySha256 = createHash("sha256").update(body).digest("base64");
+			expect(federationHeaders["x-content-sha256"]).toBe(bodySha256);
+			expect(
+				verifies(
+					federation,
+					[
+						`x-date: ${federationHeaders["x-date"]}`,
+						"(request-target): post /v1/x509",
+						"host: auth.eu-madrid-1.oraclecloud.com",
+						"content-type: application/json",
+						`content-length: ${Buffer.byteLength(body)}`,
+						`x-content-sha256: ${bodySha256}`,
+					].join("\n"),
+					instanceKey.publicKey,
+				),
+			).toBe(true);
+
+			const [readUrl, read] = callTo((url) => url.includes("/secretbundles/"));
+			const readHeaders = read.headers as Record<string, string>;
+			expect(
+				parseAuthorization(readHeaders.authorization as string).keyId,
+			).toBe(`ST$${token}`);
+			const sessionPublicKey = createPublicKey({
+				key: Buffer.from(payload.publicKey, "base64"),
+				format: "der",
+				type: "spki",
+			});
+			expect(
+				verifies(
+					read,
+					[
+						`x-date: ${readHeaders["x-date"]}`,
+						`(request-target): post ${new URL(readUrl).pathname}${new URL(readUrl).search}`,
+						"host: secrets.vaults.eu-madrid-1.oci.oraclecloud.com",
+						"content-type: application/json",
+						"content-length: 0",
+						"x-content-sha256: 47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+					].join("\n"),
+					sessionPublicKey,
+				),
+			).toBe(true);
+		});
+
+		it("reuses the token until it is about to expire", async () => {
+			const federations = () =>
+				calls().filter(([url]) => url === authUrl).length;
+
+			mockOci(sessionToken(1200));
+			let client = await loadClient();
+			await client.getSecrets(instanceConfig, ["db-url"]);
+			await client.testConnection(instanceConfig);
+			expect(federations()).toBe(1);
+
+			mockFetch.mockReset();
+			mockOci(sessionToken(30));
+			client = await loadClient();
+			await client.getSecrets(instanceConfig, ["db-url"]);
+			await client.testConnection(instanceConfig);
+			expect(federations()).toBe(2);
+		});
+
+		it("is disabled unless the server's administrator enables it", async () => {
+			vi.stubEnv("DOKPLOY_OCI_INSTANCE_PRINCIPAL", "");
+			const client = await loadClient();
+
+			await expect(client.testConnection(instanceConfig)).rejects.toThrow(
+				"setting DOKPLOY_OCI_INSTANCE_PRINCIPAL=true",
+			);
+			expect(mockFetch).not.toHaveBeenCalled();
+		});
+
+		it("explains that it needs an OCI instance when there is no metadata service", async () => {
+			mockFetch.mockRejectedValue(new TypeError("fetch failed"));
+			const client = await loadClient();
+
+			await expect(client.testConnection(instanceConfig)).rejects.toThrow(
+				"only works when Dokploy runs on an OCI compute instance",
+			);
+		});
+
+		it("names the instance when a secret cannot be read", async () => {
+			mockFetch.mockImplementation(async (url: string) => {
+				if (url.startsWith(metadataUrl)) {
+					return metadataResponse(url);
+				}
+				if (url === authUrl) {
+					return ociResponse({ token: sessionToken(1200) });
+				}
+				return ociResponse({ code: "NotAuthorizedOrNotFound" }, 404);
+			});
+			const client = await loadClient();
+
+			await expect(client.getSecrets(instanceConfig, ["nope"])).rejects.toThrow(
+				"or this instance is not allowed to read it",
+			);
+		});
 	});
 });

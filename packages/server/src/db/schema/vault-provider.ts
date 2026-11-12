@@ -98,7 +98,7 @@ const ociOcid = (...resourceTypes: string[]) =>
 			`Must be an OCID starting with ${resourceTypes.map((type) => `ocid1.${type}.`).join(" or ")}`,
 		);
 
-export const ociVaultConfigSchema = z.object({
+const ociBaseConfig = {
 	providerType: z.literal("oci"),
 	// The region becomes part of the API hostname, so only identifier characters are allowed.
 	region: z
@@ -108,20 +108,32 @@ export const ociVaultConfigSchema = z.object({
 			/^[a-z0-9]+(-[a-z0-9]+)+$/,
 			"Must be an OCI region identifier (e.g. eu-madrid-1)",
 		),
-	tenancyId: ociOcid("tenancy"),
-	userId: ociOcid("user"),
-	fingerprint: z
-		.string()
-		.trim()
-		.regex(
-			/^([0-9a-f]{2}:){15}[0-9a-f]{2}$/i,
-			"Must be an API key fingerprint (e.g. 12:34:...:ef)",
-		),
-	privateKey: z.string().min(1),
-	passphrase: z.string().optional(),
 	vaultId: ociOcid("vault"),
 	compartmentId: ociOcid("compartment", "tenancy"),
-});
+};
+
+export const ociVaultConfigSchema = z.discriminatedUnion("authType", [
+	z.object({
+		...ociBaseConfig,
+		// Defaulted so configs written without an authType keep meaning an API key.
+		authType: z.literal("apiKey").default("apiKey"),
+		tenancyId: ociOcid("tenancy"),
+		userId: ociOcid("user"),
+		fingerprint: z
+			.string()
+			.trim()
+			.regex(
+				/^([0-9a-f]{2}:){15}[0-9a-f]{2}$/i,
+				"Must be an API key fingerprint (e.g. 12:34:...:ef)",
+			),
+		privateKey: z.string().min(1),
+		passphrase: z.string().optional(),
+	}),
+	z.object({
+		...ociBaseConfig,
+		authType: z.literal("instancePrincipal"),
+	}),
+]);
 
 export const vaultProviderConfigSchema = z.discriminatedUnion("providerType", [
 	hashicorpVaultConfigSchema,

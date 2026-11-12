@@ -102,6 +102,7 @@ const VaultProviderSchema = z
 		phaseEnv: z.string(),
 		phasePath: z.string(),
 		phaseApiUrl: z.string(),
+		ociAuthType: z.enum(["apiKey", "instancePrincipal"]),
 		ociRegion: z.string(),
 		ociTenancyId: z.string(),
 		ociUserId: z.string(),
@@ -206,9 +207,14 @@ const VaultProviderSchema = z
 			});
 		}
 		if (data.providerType === "oci") {
+			const usesApiKey = data.ociAuthType === "apiKey";
 			const ocidPrefixes = [
-				["ociTenancyId", ["ocid1.tenancy."]],
-				["ociUserId", ["ocid1.user."]],
+				...(usesApiKey
+					? ([
+							["ociTenancyId", ["ocid1.tenancy."]],
+							["ociUserId", ["ocid1.user."]],
+						] as const)
+					: []),
 				["ociVaultId", ["ocid1.vault."]],
 				["ociCompartmentId", ["ocid1.compartment.", "ocid1.tenancy."]],
 			] as const;
@@ -223,6 +229,7 @@ const VaultProviderSchema = z
 				}
 			}
 			if (
+				usesApiKey &&
 				data.ociFingerprint &&
 				!/^([0-9a-f]{2}:){15}[0-9a-f]{2}$/i.test(data.ociFingerprint.trim())
 			) {
@@ -234,6 +241,15 @@ const VaultProviderSchema = z
 			}
 		}
 
+		const ociApiKeyRequired: [keyof typeof data, string][] =
+			data.ociAuthType === "apiKey"
+				? [
+						["ociTenancyId", "Tenancy OCID is required"],
+						["ociUserId", "User OCID is required"],
+						["ociFingerprint", "Fingerprint is required"],
+						["ociPrivateKey", "Private key is required"],
+					]
+				: [];
 		const required: Partial<
 			Record<ProviderType, [keyof typeof data, string][]>
 		> = {
@@ -278,10 +294,7 @@ const VaultProviderSchema = z
 			],
 			oci: [
 				["ociRegion", "Region is required"],
-				["ociTenancyId", "Tenancy OCID is required"],
-				["ociUserId", "User OCID is required"],
-				["ociFingerprint", "Fingerprint is required"],
-				["ociPrivateKey", "Private key is required"],
+				...ociApiKeyRequired,
 				["ociVaultId", "Vault OCID is required"],
 				["ociCompartmentId", "Compartment OCID is required"],
 			],
@@ -351,6 +364,7 @@ const defaultValues: VaultProviderForm = {
 	phaseEnv: "",
 	phasePath: "/",
 	phaseApiUrl: "https://api.phase.dev",
+	ociAuthType: "apiKey",
 	ociRegion: "",
 	ociTenancyId: "",
 	ociUserId: "",
@@ -432,8 +446,18 @@ const buildConfig = (data: VaultProviderForm) => {
 				apiUrl: data.phaseApiUrl || "https://api.phase.dev",
 			};
 		case "oci":
+			if (data.ociAuthType === "instancePrincipal") {
+				return {
+					providerType: "oci" as const,
+					authType: "instancePrincipal" as const,
+					region: data.ociRegion,
+					vaultId: data.ociVaultId,
+					compartmentId: data.ociCompartmentId,
+				};
+			}
 			return {
 				providerType: "oci" as const,
+				authType: "apiKey" as const,
 				region: data.ociRegion,
 				tenancyId: data.ociTenancyId,
 				userId: data.ociUserId,
@@ -486,6 +510,7 @@ export const HandleVaultProvider = ({ vaultProviderId }: Props) => {
 	});
 
 	const providerType = form.watch("providerType");
+	const ociAuthType = form.watch("ociAuthType");
 	const assignments = form.watch("assignments");
 	const { data: orgProjects } = api.project.all.useQuery();
 
@@ -576,14 +601,17 @@ export const HandleVaultProvider = ({ vaultProviderId }: Props) => {
 					phaseApiUrl: provider.config.apiUrl,
 				}),
 				...(provider.config.providerType === "oci" && {
+					ociAuthType: provider.config.authType ?? "apiKey",
 					ociRegion: provider.config.region,
-					ociTenancyId: provider.config.tenancyId,
-					ociUserId: provider.config.userId,
-					ociFingerprint: provider.config.fingerprint,
-					ociPrivateKey: provider.config.privateKey,
-					ociPassphrase: provider.config.passphrase ?? "",
 					ociVaultId: provider.config.vaultId,
 					ociCompartmentId: provider.config.compartmentId,
+					...(provider.config.authType !== "instancePrincipal" && {
+						ociTenancyId: provider.config.tenancyId,
+						ociUserId: provider.config.userId,
+						ociFingerprint: provider.config.fingerprint,
+						ociPrivateKey: provider.config.privateKey,
+						ociPassphrase: provider.config.passphrase ?? "",
+					}),
 				}),
 			});
 		} else if (!vaultProviderId) {
@@ -1280,6 +1308,32 @@ export const HandleVaultProvider = ({ vaultProviderId }: Props) => {
 								<div className="grid grid-cols-2 gap-4">
 									<FormField
 										control={form.control}
+										name="ociAuthType"
+										render={({ field }) => (
+											<FormItem>
+												<FormLabel>Authentication</FormLabel>
+												<Select
+													onValueChange={field.onChange}
+													value={field.value}
+												>
+													<FormControl>
+														<SelectTrigger>
+															<SelectValue />
+														</SelectTrigger>
+													</FormControl>
+													<SelectContent>
+														<SelectItem value="apiKey">API key</SelectItem>
+														<SelectItem value="instancePrincipal">
+															Instance principal
+														</SelectItem>
+													</SelectContent>
+												</Select>
+												<FormMessage />
+											</FormItem>
+										)}
+									/>
+									<FormField
+										control={form.control}
 										name="ociRegion"
 										render={({ field }) => (
 											<FormItem>
@@ -1291,80 +1345,96 @@ export const HandleVaultProvider = ({ vaultProviderId }: Props) => {
 											</FormItem>
 										)}
 									/>
-									<FormField
-										control={form.control}
-										name="ociFingerprint"
-										render={({ field }) => (
-											<FormItem>
-												<FormLabel>Fingerprint</FormLabel>
-												<FormControl>
-													<Input placeholder="12:34:...:ef" {...field} />
-												</FormControl>
-												<FormMessage />
-											</FormItem>
-										)}
-									/>
 								</div>
-								<FormField
-									control={form.control}
-									name="ociTenancyId"
-									render={({ field }) => (
-										<FormItem>
-											<FormLabel>Tenancy OCID</FormLabel>
-											<FormControl>
-												<Input placeholder="ocid1.tenancy.oc1..." {...field} />
-											</FormControl>
-											<FormMessage />
-										</FormItem>
-									)}
-								/>
-								<FormField
-									control={form.control}
-									name="ociUserId"
-									render={({ field }) => (
-										<FormItem>
-											<FormLabel>User OCID</FormLabel>
-											<FormControl>
-												<Input placeholder="ocid1.user.oc1..." {...field} />
-											</FormControl>
-											<FormMessage />
-										</FormItem>
-									)}
-								/>
-								<FormField
-									control={form.control}
-									name="ociPrivateKey"
-									render={({ field }) => (
-										<FormItem>
-											<FormLabel>Private Key</FormLabel>
-											<FormControl>
-												<Textarea
-													className="font-mono text-xs"
-													placeholder="-----BEGIN PRIVATE KEY-----"
-													{...field}
-												/>
-											</FormControl>
-											<FormDescription>
-												The PEM private key of an API key added to the user
-												above
-											</FormDescription>
-											<FormMessage />
-										</FormItem>
-									)}
-								/>
-								<FormField
-									control={form.control}
-									name="ociPassphrase"
-									render={({ field }) => (
-										<FormItem>
-											<FormLabel>Passphrase (optional)</FormLabel>
-											<FormControl>
-												<Input type="password" {...field} />
-											</FormControl>
-											<FormMessage />
-										</FormItem>
-									)}
-								/>
+								{ociAuthType === "instancePrincipal" ? (
+									<FormDescription>
+										Uses the identity of the OCI compute instance that runs
+										Dokploy. Create a dynamic group that matches the instance
+										and grant the policies below to it. The server's
+										administrator must set{" "}
+										<code>DOKPLOY_OCI_INSTANCE_PRINCIPAL=true</code>, because
+										every organization on the server shares that identity.
+									</FormDescription>
+								) : (
+									<>
+										<FormField
+											control={form.control}
+											name="ociTenancyId"
+											render={({ field }) => (
+												<FormItem>
+													<FormLabel>Tenancy OCID</FormLabel>
+													<FormControl>
+														<Input
+															placeholder="ocid1.tenancy.oc1..."
+															{...field}
+														/>
+													</FormControl>
+													<FormMessage />
+												</FormItem>
+											)}
+										/>
+										<FormField
+											control={form.control}
+											name="ociUserId"
+											render={({ field }) => (
+												<FormItem>
+													<FormLabel>User OCID</FormLabel>
+													<FormControl>
+														<Input placeholder="ocid1.user.oc1..." {...field} />
+													</FormControl>
+													<FormMessage />
+												</FormItem>
+											)}
+										/>
+										<FormField
+											control={form.control}
+											name="ociFingerprint"
+											render={({ field }) => (
+												<FormItem>
+													<FormLabel>Fingerprint</FormLabel>
+													<FormControl>
+														<Input placeholder="12:34:...:ef" {...field} />
+													</FormControl>
+													<FormMessage />
+												</FormItem>
+											)}
+										/>
+										<FormField
+											control={form.control}
+											name="ociPrivateKey"
+											render={({ field }) => (
+												<FormItem>
+													<FormLabel>Private Key</FormLabel>
+													<FormControl>
+														<Textarea
+															className="font-mono text-xs"
+															placeholder="-----BEGIN PRIVATE KEY-----"
+															{...field}
+														/>
+													</FormControl>
+													<FormDescription>
+														The PEM private key of an API key added to the user
+														above
+													</FormDescription>
+													<FormMessage />
+												</FormItem>
+											)}
+										/>
+										<FormField
+											control={form.control}
+											name="ociPassphrase"
+											render={({ field }) => (
+												<FormItem>
+													<FormLabel>Passphrase (optional)</FormLabel>
+													<FormControl>
+														<Input type="password" {...field} />
+													</FormControl>
+													<FormMessage />
+												</FormItem>
+											)}
+										/>
+									</>
+								)}
 								<FormField
 									control={form.control}
 									name="ociVaultId"
